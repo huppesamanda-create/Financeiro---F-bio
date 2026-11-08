@@ -152,3 +152,49 @@ VALUES
   ('treasury-fixed-2029', 'Tesouro Prefixado 2029', 0, 20, TRUE, 'treasury-2029', 'treasury_fixed', DATE '2029-01-01', 14.95),
   ('treasury-fixed-2032', 'Tesouro Prefixado 2032', 0, 30, TRUE, 'treasury-2032', 'treasury_fixed', DATE '2032-01-01', 15.48)
 ON CONFLICT (id) DO NOTHING;
+
+-- Cartões de crédito (PF)
+CREATE TABLE IF NOT EXISTS ld4_finance_credit_cards (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  closing_day SMALLINT NOT NULL CHECK (closing_day BETWEEN 1 AND 31),
+  due_day SMALLINT NOT NULL CHECK (due_day BETWEEN 1 AND 31),
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ld4_finance_credit_cards_active_idx
+  ON ld4_finance_credit_cards(active, sort_order, name);
+
+CREATE TABLE IF NOT EXISTS ld4_finance_credit_card_purchases (
+  id TEXT PRIMARY KEY,
+  purchase_date DATE NOT NULL,
+  card_id TEXT NOT NULL REFERENCES ld4_finance_credit_cards(id),
+  category_id TEXT NOT NULL REFERENCES ld4_finance_categories(id),
+  description TEXT NOT NULL DEFAULT '',
+  total_amount NUMERIC(14,2) NOT NULL CHECK (total_amount > 0),
+  installments SMALLINT NOT NULL DEFAULT 1 CHECK (installments BETWEEN 1 AND 36),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ld4_finance_credit_card_purchases_date_idx
+  ON ld4_finance_credit_card_purchases(purchase_date);
+
+CREATE INDEX IF NOT EXISTS ld4_finance_credit_card_purchases_card_idx
+  ON ld4_finance_credit_card_purchases(card_id, purchase_date);
+
+CREATE TABLE IF NOT EXISTS ld4_finance_credit_card_invoices (
+  card_id TEXT NOT NULL REFERENCES ld4_finance_credit_cards(id),
+  due_date DATE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'paid')),
+  paid_date DATE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (card_id, due_date),
+  CHECK ((status = 'open') OR (status = 'paid' AND paid_date IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS ld4_finance_credit_card_invoices_status_idx
+  ON ld4_finance_credit_card_invoices(status, due_date);

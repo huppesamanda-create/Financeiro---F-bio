@@ -805,7 +805,11 @@ async function handleApi(req, res, url) {
       yearResult,
       reserveAccountsResult,
       reserveTransfersResult,
-      recurringRulesResult
+      recurringRulesResult,
+      creditCardsResult,
+      creditCardCatalogResult,
+      creditCardPurchasesResult,
+      creditCardInvoicesResult
     ] = await Promise.all([
       pool.query(
         `SELECT id, TO_CHAR(transaction_date, 'YYYY-MM-DD') AS transaction_date, type, nature, amount, category_id, status, description, recurring_rule_id
@@ -906,6 +910,34 @@ async function handleApi(req, res, url) {
          FROM ld4_finance_recurring_rules
         WHERE active = TRUE
         ORDER BY category_id ASC, day_of_month ASC, name ASC`
+      ),
+      pool.query(
+        `SELECT id, name, closing_day, due_day, sort_order
+           FROM ld4_finance_credit_cards
+          WHERE active = TRUE
+          ORDER BY sort_order ASC, name ASC`
+      ),
+      pool.query(
+        `SELECT id, name, closing_day, due_day, sort_order, active
+           FROM ld4_finance_credit_cards
+          ORDER BY sort_order ASC, name ASC`
+      ),
+      pool.query(
+        `SELECT id, TO_CHAR(purchase_date, 'YYYY-MM-DD') AS purchase_date, card_id, category_id, description, total_amount, installments
+           FROM ld4_finance_credit_card_purchases
+          WHERE purchase_date >= $1::date - INTERVAL '3 years'
+            AND purchase_date < $2::date
+          ORDER BY purchase_date ASC, created_at ASC`,
+        [start, end]
+      ),
+      pool.query(
+        `SELECT card_id, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, status,
+                CASE WHEN paid_date IS NULL THEN NULL ELSE TO_CHAR(paid_date, 'YYYY-MM-DD') END AS paid_date
+           FROM ld4_finance_credit_card_invoices
+          WHERE due_date >= $1::date - INTERVAL '3 years'
+            AND due_date < ($2::date + INTERVAL '1 year')
+          ORDER BY due_date ASC, card_id ASC`,
+        [start, end]
       )
     ]);
 
@@ -990,6 +1022,36 @@ async function handleApi(req, res, url) {
         startMonth: row.start_month,
         endMonth: row.end_month,
         active: Boolean(row.active)
+      })),
+      creditCards: creditCardsResult.rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        closingDay: Number(row.closing_day),
+        dueDay: Number(row.due_day),
+        sortOrder: Number(row.sort_order || 0)
+      })),
+      creditCardCatalog: creditCardCatalogResult.rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        closingDay: Number(row.closing_day),
+        dueDay: Number(row.due_day),
+        sortOrder: Number(row.sort_order || 0),
+        active: Boolean(row.active)
+      })),
+      creditCardPurchases: creditCardPurchasesResult.rows.map(row => ({
+        id: row.id,
+        date: String(row.purchase_date).slice(0, 10),
+        card: row.card_id,
+        category: row.category_id,
+        description: row.description || '',
+        value: Number(row.total_amount || 0),
+        installments: Number(row.installments || 1)
+      })),
+      creditCardInvoices: creditCardInvoicesResult.rows.map(row => ({
+        card: row.card_id,
+        dueDate: String(row.due_date).slice(0, 10),
+        status: row.status,
+        paidDate: row.paid_date ? String(row.paid_date).slice(0, 10) : null
       }))
     });
     return true;
@@ -1685,6 +1747,180 @@ async function handleApi(req, res, url) {
     } finally {
       client.release();
     }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/finance/cards") {
+    const body = await readJson(req);
+    const name = String(body.name || "").trim().slice(0, 120);
+    const closingDay = Number(body.closingDay);
+    const dueDay = Number(body.dueDay);
+
+    if (!name || !Number.isInteger(closingDay) || closingDay < 1 || closingDay > 31 || !Number.isInteger(dueDay) || dueDay < 1 || dueDay > 31) {
+      sendJson(res, 400, { error: "Dados do cartão inválidos." });
+      return true;
+    }
+
+    const sortResult = await pool.query(`SELECT COALESCE(MAX(sort_order), 0) + 10 AS next_order FROM ld4_finance_credit_cards`);
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO ld4_finance_credit_cards (id, name, closing_day, due_day, sort_order, active, updated_at)
+       VALUES ($1, $2, $3, $4, $5, TRUE, NOW())`,
+      [id, name, closingDay, dueDay, Number(sortResult.rows[0]?.next_order || 10)]
+    );
+
+    sendJson(res, 201, { id });
+    return true;
+  }
+
+  const financeCardMatch = url.pathname.match(/^\/api\/finance\/cards\/([^/]+)$/);
+
+  if (req.method === "PUT" && financeCardMatch) {
+    const id = decodeURIComponent(financeCardMatch[1]);
+    const body = await readJson(req);
+    const name = String(body.name || "").trim().slice(0, 120);
+    const closingDay = Number(body.closingDay);
+    const dueDay = Number(body.dueDay);
+
+    if (!name || !Number.isInteger(closingDay) || closingDay < 1 || closingDay > 31 || !Number.isInteger(dueDay) || dueDay < 1 || dueDay > 31) {
+      sendJson(res, 400, { error: "Dados do cartão inválidos." });
+      return true;
+    }
+
+    const result = await pool.query(
+      `UPDATE ld4_finance_credit_cards
+          SET name = $2, closing_day = $3, due_day = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id`,
+      [id, name, closingDay, dueDay]
+    );
+
+    if (!result.rows.length) {
+      sendJson(res, 404, { error: "Cartão não encontrado." });
+      return true;
+    }
+
+    sendJson(res, 200, { id });
+    return true;
+  }
+
+  if (req.method === "DELETE" && financeCardMatch) {
+    const id = decodeURIComponent(financeCardMatch[1]);
+    const result = await pool.query(
+      `UPDATE ld4_finance_credit_cards SET active = FALSE, updated_at = NOW() WHERE id = $1 RETURNING id`,
+      [id]
+    );
+
+    if (!result.rows.length) {
+      sendJson(res, 404, { error: "Cartão não encontrado." });
+      return true;
+    }
+
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/finance/card-purchases") {
+    const body = await readJson(req);
+    const purchaseDate = String(body.date || "");
+    const card = String(body.card || "");
+    const category = String(body.category || "");
+    const description = cleanFinanceDescription(body.description);
+    const amount = Number(body.value);
+    const installments = Number(body.installments || 1);
+
+    if (!validDay(purchaseDate) || !card || !category || !Number.isFinite(amount) || amount <= 0 || !Number.isInteger(installments) || installments < 1 || installments > 36) {
+      sendJson(res, 400, { error: "Compra no cartão inválida." });
+      return true;
+    }
+
+    const checks = await Promise.all([
+      pool.query(`SELECT id FROM ld4_finance_credit_cards WHERE id = $1 AND active = TRUE LIMIT 1`, [card]),
+      pool.query(`SELECT id FROM ld4_finance_categories WHERE id = $1 AND active = TRUE LIMIT 1`, [category])
+    ]);
+    if (!checks[0].rows.length || !checks[1].rows.length) {
+      sendJson(res, 400, { error: "Cartão ou categoria inválidos." });
+      return true;
+    }
+
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO ld4_finance_credit_card_purchases
+        (id, purchase_date, card_id, category_id, description, total_amount, installments, updated_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())`,
+      [id, purchaseDate, card, category, description, amount, installments]
+    );
+
+    sendJson(res, 201, { id });
+    return true;
+  }
+
+  const cardPurchaseMatch = url.pathname.match(/^\/api\/finance\/card-purchases\/([^/]+)$/);
+
+  if (req.method === "PUT" && cardPurchaseMatch) {
+    const id = decodeURIComponent(cardPurchaseMatch[1]);
+    const body = await readJson(req);
+    const purchaseDate = String(body.date || "");
+    const card = String(body.card || "");
+    const category = String(body.category || "");
+    const description = cleanFinanceDescription(body.description);
+    const amount = Number(body.value);
+    const installments = Number(body.installments || 1);
+
+    if (!validDay(purchaseDate) || !card || !category || !Number.isFinite(amount) || amount <= 0 || !Number.isInteger(installments) || installments < 1 || installments > 36) {
+      sendJson(res, 400, { error: "Compra no cartão inválida." });
+      return true;
+    }
+
+    const result = await pool.query(
+      `UPDATE ld4_finance_credit_card_purchases
+          SET purchase_date = $2::date, card_id = $3, category_id = $4, description = $5,
+              total_amount = $6, installments = $7, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id`,
+      [id, purchaseDate, card, category, description, amount, installments]
+    );
+
+    if (!result.rows.length) {
+      sendJson(res, 404, { error: "Compra não encontrada." });
+      return true;
+    }
+    sendJson(res, 200, { id });
+    return true;
+  }
+
+  if (req.method === "DELETE" && cardPurchaseMatch) {
+    const id = decodeURIComponent(cardPurchaseMatch[1]);
+    const result = await pool.query(`DELETE FROM ld4_finance_credit_card_purchases WHERE id = $1 RETURNING id`, [id]);
+    if (!result.rows.length) {
+      sendJson(res, 404, { error: "Compra não encontrada." });
+      return true;
+    }
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === "PUT" && url.pathname === "/api/finance/card-invoice") {
+    const body = await readJson(req);
+    const card = String(body.card || "");
+    const dueDate = String(body.dueDate || "");
+    const status = String(body.status || "");
+    const paidDate = body.paidDate ? String(body.paidDate) : null;
+
+    if (!card || !validDay(dueDate) || !["open", "paid"].includes(status) || (status === "paid" && !validDay(paidDate))) {
+      sendJson(res, 400, { error: "Situação da fatura inválida." });
+      return true;
+    }
+
+    await pool.query(
+      `INSERT INTO ld4_finance_credit_card_invoices (card_id, due_date, status, paid_date, updated_at)
+       VALUES ($1, $2::date, $3, $4::date, NOW())
+       ON CONFLICT (card_id, due_date)
+       DO UPDATE SET status = EXCLUDED.status, paid_date = EXCLUDED.paid_date, updated_at = NOW()`,
+      [card, dueDate, status, status === "paid" ? paidDate : null]
+    );
+
+    sendJson(res, 200, { ok: true });
+    return true;
   }
 
   if (req.method === "POST" && url.pathname === "/api/finance/transactions") {
